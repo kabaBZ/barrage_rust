@@ -11,25 +11,28 @@ from wordcloud import WordCloud
 
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 host = socket.gethostbyname("danmuproxy.douyu.com")
-port = 8503
+port = 8506
 client.connect((host, port))
 
 
 # 根据斗鱼后台协议发送数据
 def sendmsg(msgstr):
-    msg = msgstr.encode("utf-8")
-    msg_len = len(msg) + 8
-    code = 689
-    msgHead = (
-        int.to_bytes(msg_len, 4, "little")
-        + int.to_bytes(msg_len, 4, "little")
-        + int.to_bytes(code, 4, "little")
-    )
-    client.send(msgHead)
-    s = 0
-    while s < len(msg):
-        l = client.send(msg[s:])
-        s = s + l
+    # 头部8字节，尾部1字节，与字符串长度相加即数据长度
+    # 为什么不加最开头的那个消息长度所占4字节呢？这得问问斗鱼^^
+    data_len = len(msgstr) + 9
+    # 字符串转化为字节流
+    msg_byte = msgstr.encode("utf-8")
+    # 将数据长度转化为小端整数字节流
+    len_byte = int.to_bytes(data_len, 4, "little")
+    # 前两个字节按照小端顺序拼接为0x02b1，转化为十进制即689（《协议》中规定的客户端发送消息类型）
+    # 后两个字节即《协议》中规定的加密字段与保留字段，置0
+    send_byte = bytearray([0xB1, 0x02, 0x00, 0x00])
+    # 尾部以'\0'结束
+    end_byte = bytearray([0x00])
+    # 按顺序拼接在一起
+    data = len_byte + len_byte + send_byte + msg_byte + end_byte
+    client.send(data)
+
 
 
 # 根据房间号获取房间名
@@ -67,17 +70,18 @@ def filterword(filterdata):
 # 获取弹幕数据
 def get_Barrage(roomid, barrage_num):
     # 用于完成登录授权
-    msg_login = "type@=loginreq/username@=rieuse/password@=douyu/roomid@={}/\0".format(
-        roomid
+    login_msg = (
+            "type@=loginreq/roomid@=%s/dfl@=sn@AA=105@ASss@AA=1/"
+            "username@=%s/uid@=%s/ver@=20190610/aver@=218101901/ct@=0/."
+            % (roomid, "99047358", "99047358")
     )
-    sendmsg(msg_login)
+    sendmsg(login_msg)
     # 用于获取弹幕信息
-    msg_getdata = "type@=joingroup/rid@={}/gid@=-9999/\0".format(roomid)
+    msg_getdata = "type@=joingroup/rid@={}/gid@=1/".format(roomid)
     sendmsg(msg_getdata)
     room_name = get_room_name(roomid)
     print("已连接至{}的直播间".format(room_name))
-    barrage_list = []
-    barrage_list.append(["用户id", "昵称", "等级", "内容"])
+    barrage_list = [["用户id", "昵称", "等级", "内容"]]
     flag = True
     while flag:
         try:
@@ -141,14 +145,16 @@ def get_Barrage(roomid, barrage_num):
 # 保持登录状态
 def keeplive():
     while True:
-        msg = "type@=keeplive/tick@=" + str(int(time.time())) + "/\0"
+        msg = "type@=mrkl/"
         sendmsg(msg)
         time.sleep(15)
 
 
 if __name__ == "__main__":
-    room_id = input("请输入房间ID：")
-    barrage_num = input("请输入需要的弹幕数量：")
+    # room_id = input("请输入房间ID：")
+    room_id = '11144156'
+    # barrage_num = input("请输入需要的弹幕数量：")
+    barrage_num = 10
     barrage_num = int(barrage_num)
     process1 = multiprocessing.Process(target=get_Barrage, args=(room_id, barrage_num))
     process2 = multiprocessing.Process(target=keeplive)
