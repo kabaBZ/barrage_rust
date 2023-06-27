@@ -1,12 +1,19 @@
-use std::error::Error;
-use std::sync::{Arc, Mutex};
+// extern crate tungstenite;
+// extern crate url;
+// use websocket::client;
+use native_tls::{TlsConnector, TlsStream};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::thread;
-use std::time::{Duration, Instant};
-use tungstenite::client::uri_mode::UriMode;
-use tungstenite::client::uri_mode::WsMode;
-use tungstenite::connect;
-use tungstenite::handshake::client::Request;
-use tungstenite::protocol::Message;
+use std::time::Duration;
+// use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+// use std::thread;
+// use tungstenite::client::AutoStream;
+// use tungstenite::protocol::Message;
+// use url::Url;
+// use websocket::ClientBuilder;
 
 struct DyDanmuMsgHandler;
 
@@ -15,8 +22,8 @@ impl DyDanmuMsgHandler {
         let data_len = msg.len() + 9;
         let len_byte = (data_len as u32).to_le_bytes();
         let msg_byte = msg.as_bytes();
-        let send_byte = [0xB1, 0x02, 0x00, 0x00];
-        let end_byte = [0x00];
+        let send_byte: [u8; 4] = [0xB1, 0x02, 0x00, 0x00];
+        let end_byte: [u8; 1] = [0x00];
 
         let mut data = Vec::new();
         data.extend_from_slice(&len_byte);
@@ -28,14 +35,16 @@ impl DyDanmuMsgHandler {
         data
     }
 
-    fn parse_msg(&self, raw_msg: &str) -> Vec<(String, String)> {
-        let attrs: Vec<&str> = raw_msg.split("/").collect();
-        let mut res = Vec::new();
-        for attr in attrs {
+    fn parse_msg(&self, raw_msg: &str) -> HashMap<String, String> {
+        let mut res = HashMap::new();
+        let attrs: Vec<&str> = raw_msg.split('/').collect();
+        for attr in attrs[..attrs.len() - 1].iter() {
             let attr = attr.replace("@s", "/");
             let attr = attr.replace("@A", "@");
-            let couple: Vec<&str> = attr.split("@=").collect();
-            res.push((couple[0].to_string(), couple[1].to_string()));
+            let couple: Vec<&str> = attr.splitn(2, "@=").collect();
+            if couple.len() == 2 {
+                res.insert(couple[0].to_owned(), couple[1].to_owned());
+            }
         }
         res
     }
@@ -49,25 +58,21 @@ impl DyDanmuMsgHandler {
                 msg_byte[pos + 1],
                 msg_byte[pos + 2],
                 msg_byte[pos + 3],
-            ]);
-            let content =
-                String::from_utf8_lossy(&msg_byte[pos + 12..pos + 3 + content_length as usize])
-                    .to_string();
-            msg.push(content);
-            pos += 4 + content_length as usize;
+            ]) as usize;
+            let content = String::from_utf8_lossy(&msg_byte[pos + 12..pos + 3 + content_length]);
+            msg.push(content.into_owned());
+            pos += 4 + content_length;
         }
         msg
     }
 
-    fn get_chat_messages(&self, msg_byte: &[u8]) -> Vec<(String, String)> {
+    fn get_chat_messages(&self, msg_byte: &[u8]) -> Vec<HashMap<String, String>> {
         let decode_msg = self.dy_decode(msg_byte);
         let mut messages = Vec::new();
         for msg in decode_msg {
             let res = self.parse_msg(&msg);
-            if let Some(("type", value)) = res.get(0) {
-                if value == "chatmsg" {
-                    messages.push(res);
-                }
+            if res.get("type") == Some(&"chatmsg".to_owned()) {
+                messages.push(res);
             }
         }
         messages
@@ -76,66 +81,152 @@ impl DyDanmuMsgHandler {
 
 struct DyDanmuCrawler {
     room_id: String,
-    client: Option<tungstenite::WebSocket<tungstenite::client::AutoStream>>,
+    heartbeat_timer: Option<std::time::Instant>,
+    client: Arc<Mutex<TlsStream<TcpStream>>>,
     msg_handler: DyDanmuMsgHandler,
-    keep_heartbeat: bool,
-    heartbeat_timer: Option<tokio::time::Instant>,
 }
 
 impl DyDanmuCrawler {
-    fn new(room_id: &str) -> DyDanmuCrawler {
-        DyDanmuCrawler {
-            room_id: room_id.to_string(),
-            client: None,
-            msg_handler: DyDanmuMsgHandler,
-            keep_heartbeat: true,
+    fn new(room_id: String) -> Result<Self, tungstenite::error::Error> {
+        let connector = TlsConnector::new().unwrap();
+        println!("pre");
+        let client = TcpStream::connect("danmuproxy.douyu.com:8506").unwrap();
+        let client = Arc::new(Mutex::new(
+            connector.connect("danmuproxy.douyu.com", client).unwrap(),
+        ));
+        client
+            .lock()
+            .unwrap()
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("Failed to set read timeout");
+        println!("connected");
+        Ok(DyDanmuCrawler {
+            room_id,
             heartbeat_timer: None,
-        }
+            client,
+            msg_handler: DyDanmuMsgHandler,
+        })
     }
 
-    async fn start(&mut self) -> Result<(), Box<dyn Error>> {
-        let url = "wss://danmuproxy.douyu.com:8506/";
-        let request = Request {
-            uri: url.parse()?,
-            extra_headers: Vec::new(),
-            mode: UriMode::Ws(WsMode::Binary),
-        };
-        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (response, _) = connect(request).await?;
-        self.client = Some(tx);
-        let room_id = self.room_id.clone();
-        tokio::spawn(async move {
-            let (mut write, mut read) = response.split();
-            let join_group_msg = format!("type@=joingroup/rid@={}/gid@=1/", room_id);
-            let msg_bytes = self.msg_handler.dy_encode(&join_group_msg);
-            write.send(Message::Binary(msg_bytes)).await.unwrap();
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(Message::Binary(msg_bytes)) => {
-                        let chat_messages = self.msg_handler.get_chat_messages(&msg_bytes);
-                        for message in chat_messages {
-                            println!("{}: {}", message[0].1, message[1].1);
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(err) => {
-                        println!("Error: {}", err);
-                        break;
-                    }
-                    _ => {}
-                }
+    fn start(&mut self) {
+        self.prepare();
+        println!("prepared");
+        self.receive_messages();
+    }
+
+    // fn stop(&mut self) {
+    //     self.client.shutdown().unwrap();
+    //     self.keep_heartbeat = false;
+    // }
+
+    // fn on_error(&self, err: tungstenite::error::Error) {
+    //     println!("{}", err);
+    // }
+
+    // fn on_close(&self) {
+    //     println!("close");
+    // }
+
+    fn join_group(&mut self) {
+        println!("join");
+        let join_group_msg = format!("type@=joingroup/rid@={}/gid@=1/", self.room_id);
+        let msg_bytes = self.msg_handler.dy_encode(&join_group_msg);
+        self.client.lock().unwrap().write_all(&msg_bytes).unwrap();
+        println!("join:{:?}", msg_bytes);
+    }
+
+    fn login(&mut self) {
+        println!("login");
+        let login_msg = format!(
+            "type@=loginreq/roomid@={}/dfl@=sn@AA=105@ASss@AA=1/username@={}/uid@={}/ver@=20190610/aver@=218101901/ct@=0/.",
+            self.room_id, "99047358", "99047358"
+        );
+        let msg_bytes = self.msg_handler.dy_encode(&login_msg);
+        self.client.lock().unwrap().write_all(&msg_bytes).unwrap();
+        println!("login:{:?}", msg_bytes);
+    }
+
+    fn start_heartbeat(&mut self) {
+        println!("heartbeat");
+        self.heartbeat_timer = Some(std::time::Instant::now());
+        self.heartbeat();
+    }
+
+    fn heartbeat(&mut self) {
+        let heartbeat_msg = "type@=mrkl/";
+        let heartbeat_msg_bytes = self.msg_handler.dy_encode(&heartbeat_msg);
+        self.client
+            .lock()
+            .unwrap()
+            .write_all(&heartbeat_msg_bytes)
+            .unwrap();
+        println!("beat1:{:?}", heartbeat_msg_bytes);
+        let thread_client = Arc::clone(&self.client);
+        thread::spawn(move || {
+            while true {
+                thread::sleep(Duration::from_secs(10));
+                println!("beat");
+                let mut x = thread_client.lock().unwrap();
+                println!("beatlock");
+                x.write_all(&heartbeat_msg_bytes.clone()).unwrap();
+                println!("beat:{:?}", &heartbeat_msg_bytes.clone());
             }
         });
-        Ok(())
+    }
+
+    fn prepare(&mut self) {
+        self.login();
+        self.join_group();
+        self.start_heartbeat();
+    }
+
+    fn receive_messages(&mut self) {
+        // let (tx, rx) = mpsc::channel();
+        // let client_clone = self.client;
+
+        // thread::spawn(move || {
+        //     while let Ok(msg) = client_clone.() {
+        //         if let Message::Binary(msg_bytes) = msg {
+        //             tx.send(msg_bytes).unwrap();
+        //         }
+        //     }
+        // });
+
+        loop {
+            println!("recieve");
+            let mut buf = vec![];
+            let mut x = self.client.lock().unwrap();
+            println!("recieve locked");
+            let res = x.read_to_end(&mut buf);
+            if let Err(error) = res {
+                println!("Error: {}", error);
+            } else {
+                let _ = res.unwrap();
+                self.receive_msg(&mut buf);
+            }
+        }
+
+        // for msg_bytes in rx {
+        //     self.receive_msg(&msg_bytes);
+        // }
+    }
+
+    fn receive_msg(&self, msg_bytes: &[u8]) {
+        let chat_messages = self.msg_handler.get_chat_messages(msg_bytes);
+        for message in chat_messages {
+            if let Some(nn) = message.get("nn") {
+                if let Some(txt) = message.get("txt") {
+                    println!("{}: {}", nn, txt);
+                }
+            }
+        }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let room_id = "11144156";
-    let mut crawler = DyDanmuCrawler::new(room_id);
-    let mut rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        crawler.start().await?;
-    });
-    Ok(())
+fn main() {
+    let room_id = "11144156".to_owned();
+    let mut dy_barrage_crawler = DyDanmuCrawler::new(room_id).unwrap();
+    println!("newed");
+    dy_barrage_crawler.start();
 }
