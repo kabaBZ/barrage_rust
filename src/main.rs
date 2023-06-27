@@ -19,12 +19,24 @@ struct DyDanmuMsgHandler;
 
 impl DyDanmuMsgHandler {
     fn dy_encode(&self, msg: &str) -> Vec<u8> {
+        // 头部8字节，尾部1字节，与字符串长度相加即数据长度
+        // 为什么不加最开头的那个消息长度所占4字节呢？这得问问斗鱼^^
         let data_len = msg.len() + 9;
-        let len_byte = (data_len as u32).to_le_bytes();
+
+        // 字符串转化为字节流
         let msg_byte = msg.as_bytes();
+
+        // 将数据长度转化为小端整数字节流
+        let len_byte = (data_len as u32).to_le_bytes();
+
+        // 前两个字节按照小端顺序拼接为0x02b1，转化为十进制即689（《协议》中规定的客户端发送消息类型）
+        // 后两个字节即《协议》中规定的加密字段与保留字段，置0
         let send_byte: [u8; 4] = [0xB1, 0x02, 0x00, 0x00];
+
+        // 尾部以'\0'结束
         let end_byte: [u8; 1] = [0x00];
 
+        // 按顺序拼接在一起
         let mut data = Vec::new();
         data.extend_from_slice(&len_byte);
         data.extend_from_slice(&len_byte);
@@ -35,32 +47,37 @@ impl DyDanmuMsgHandler {
         data
     }
 
-    fn parse_msg(&self, raw_msg: &str) -> HashMap<String, String> {
-        let mut res = HashMap::new();
+    fn parse_msg(&self, raw_msg: &str) -> std::collections::HashMap<String, String> {
+        let mut res = std::collections::HashMap::new();
         let attrs: Vec<&str> = raw_msg.split('/').collect();
-        for attr in attrs[..attrs.len() - 1].iter() {
+        for attr in attrs.iter().take(attrs.len() - 1) {
             let attr = attr.replace("@s", "/");
             let attr = attr.replace("@A", "@");
-            let couple: Vec<&str> = attr.splitn(2, "@=").collect();
-            if couple.len() == 2 {
-                res.insert(couple[0].to_owned(), couple[1].to_owned());
+            let couple: Vec<&str> = attr.split("@=").collect();
+            if let Some(key) = couple.get(0) {
+                if let Some(value) = couple.get(1) {
+                    res.insert(key.to_string(), value.to_string());
+                }
             }
         }
         res
     }
-
     fn dy_decode(&self, msg_byte: &[u8]) -> Vec<String> {
         let mut pos = 0;
         let mut msg = Vec::new();
         while pos < msg_byte.len() {
+            let content_length_bytes = &msg_byte[pos..pos + 4];
             let content_length = u32::from_le_bytes([
-                msg_byte[pos],
-                msg_byte[pos + 1],
-                msg_byte[pos + 2],
-                msg_byte[pos + 3],
+                content_length_bytes[0],
+                content_length_bytes[1],
+                content_length_bytes[2],
+                content_length_bytes[3],
             ]) as usize;
-            let content = String::from_utf8_lossy(&msg_byte[pos + 12..pos + 3 + content_length]);
-            msg.push(content.into_owned());
+
+            let content_bytes = &msg_byte[pos + 12..pos + 3 + content_length];
+            let content = String::from_utf8_lossy(content_bytes).to_string();
+
+            msg.push(content);
             pos += 4 + content_length;
         }
         msg
@@ -162,7 +179,7 @@ impl DyDanmuCrawler {
             let mut x = thread_client.lock().unwrap();
             println!("beatlock");
             x.write_all(&heartbeat_msg_bytes.clone()).unwrap();
-            println!("beat:{:?}", &heartbeat_msg_bytes.clone());
+            println!("beat:{:?}", String::from_utf8_lossy(&heartbeat_msg_bytes));
             drop(x);
             thread::sleep(Duration::from_secs(10));
         });
