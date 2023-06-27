@@ -156,22 +156,15 @@ impl DyDanmuCrawler {
     fn heartbeat(&mut self) {
         let heartbeat_msg = "type@=mrkl/";
         let heartbeat_msg_bytes = self.msg_handler.dy_encode(&heartbeat_msg);
-        self.client
-            .lock()
-            .unwrap()
-            .write_all(&heartbeat_msg_bytes)
-            .unwrap();
-        println!("beat1:{:?}", heartbeat_msg_bytes);
         let thread_client = Arc::clone(&self.client);
-        thread::spawn(move || {
-            while true {
-                thread::sleep(Duration::from_secs(10));
-                println!("beat");
-                let mut x = thread_client.lock().unwrap();
-                println!("beatlock");
-                x.write_all(&heartbeat_msg_bytes.clone()).unwrap();
-                println!("beat:{:?}", &heartbeat_msg_bytes.clone());
-            }
+        thread::spawn(move || loop {
+            println!("beat");
+            let mut x = thread_client.lock().unwrap();
+            println!("beatlock");
+            x.write_all(&heartbeat_msg_bytes.clone()).unwrap();
+            println!("beat:{:?}", &heartbeat_msg_bytes.clone());
+            drop(x);
+            thread::sleep(Duration::from_secs(10));
         });
     }
 
